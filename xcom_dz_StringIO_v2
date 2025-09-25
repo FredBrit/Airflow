@@ -1,0 +1,156 @@
+from airflow import DAG
+from airflow.operators.empty import EmptyOperator
+from airflow.operators.python import PythonOperator
+from datetime import datetime, timedelta
+import requests
+import pandas as pd
+import json
+import logging
+import os
+from io import StringIO
+from airflow.hooks.base import BaseHook
+from clickhouse_driver import Client
+
+
+# Путь к файлу с предыдущим состоянием
+STATE_FILE = '/opt/airflow/airflow_data/xcom_dz_state.json'
+
+def fetch_data_to_xcom(**kwargs):
+    logger = logging.getLogger(__name__)
+    ds = kwargs['ds']
+    ti = kwargs['ti']
+
+    logger.info(f"Processing date: {ds}")
+
+    if ds == '2024-01-01':
+        if os.path.exists(STATE_FILE):
+            os.remove(STATE_FILE)
+            logger.info(f"Файл состояния удалён: {STATE_FILE}")
+
+    # 🔹 Читаем предыдущий список файлов из файла
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, 'r', encoding='utf-8') as f:
+            prev_file_list = json.load(f)
+        logger.info(f"Loaded previous file list from {STATE_FILE}")
+    else:
+        prev_file_list = []
+        logger.info("No previous file list found (first run).")
+
+    # 🔹 Получаем текущий список файлов
+    api_url = 'http://158.160.116.58:4009/files/'
+    response = requests.get(f"{api_url}{ds}")
+    if response.status_code != 200:
+        raise AirflowException(f"Request failed: {response.status_code}")
+
+    file_path = '/opt/airflow/airflow_data/xcom_file.json'
+    with open(file_path, 'w', encoding='utf-8') as f:
+        json.dump(response.json(), f, ensure_ascii=False, indent=2)
+
+    with open(file_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    current_file_list = data['files']
+
+    # 🔹 Находим новые файлы
+    new_files = [f for f in current_file_list if f not in prev_file_list]
+    logger.info(f"Previous files: {prev_file_list}")
+    logger.info(f"Current files: {current_file_list}")
+    logger.info(f"New files: {new_files}")
+
+    # 🔹 Сохраняем текущий список в файл для следующего запуска
+    with open(STATE_FILE, 'w', encoding='utf-8') as f:
+        json.dump(current_file_list, f, ensure_ascii=False, indent=2)
+
+    logger.info(f"Saved current file list to {STATE_FILE}")
+
+    ti.xcom_push(
+        key='prev_file',
+        value=new_files
+    )
+
+    return new_files  # попадёт в return_value
+
+def upload_to_clickhouse(table_name, **kwargs):
+    logger = logging.getLogger(__name__)
+    ti = kwargs['ti']
+
+    # ✅ Получаем new_files из XCom
+    new_files = ti.xcom_pull(
+        task_ids='fetch_data_to_xcom',
+        key='return_value'
+    )
+
+    if not new_files:
+        logger.warning("No new files to upload.")
+        return
+
+
+    # 🔹 Получаем параметры подключения из Airflow Connection
+    conn = BaseHook.get_connection("ch_client")
+    ch_client = Client(
+        host=conn.host,
+        port=conn.port or 9000,
+        user=conn.login,
+        password=conn.password,
+        database=conn.schema or 'default'
+    )
+    
+    table_exists = ch_client.execute(f"EXISTS TABLE {table_name}")[0][0]
+
+    if not table_exists:
+        ch_client.execute(f'''
+        CREATE TABLE IF NOT EXISTS {table_name} (
+        campaign String, 
+        cost Int64, 
+        date  String
+        )
+        ENGINE = MergeTree()
+        PRIMARY KEY (date)
+        ORDER BY (date)
+        ''')
+
+    endpoint_url = 'http://158.160.116.58:4009/download/'
+
+    for file in new_files:
+        file_url = f"{endpoint_url}{file}"
+        response = requests.get(file_url)
+        df = pd.read_csv(StringIO(response.text))
+
+        ch_client.execute(f'INSERT INTO {table_name} VALUES', df.to_dict('records'))     
+
+    print(f"Uploaded data for {kwargs['ds']}")
+    logger.info(f"Список файлов из которых будем добавлять данные: {new_files}")
+
+    
+
+
+
+with DAG(
+    'xcom_dz_v53',
+    schedule='@daily',
+    start_date=datetime(2024, 1, 1),
+    end_date=datetime(2024, 1, 4),
+    catchup=True,
+    max_active_runs=1,
+    tags=['XCom'],
+    default_args={
+        'owner': 'airflow',
+        'retries': 1,
+        'retry_delay': timedelta(minutes=5),
+    }
+) as dag:
+
+    start = EmptyOperator(task_id='start')
+
+    fetch_task = PythonOperator(
+        task_id='fetch_data_to_xcom',
+        python_callable=fetch_data_to_xcom,
+    )
+
+    upload_task = PythonOperator(
+        task_id='upload_to_clickhouse',
+        python_callable=upload_to_clickhouse,
+        op_args = ['fedos_af_xcom']
+    )
+
+    start >> fetch_task >> upload_task

@@ -66,11 +66,12 @@ def transform_data(**context):
     data_frame.to_csv(csv_file, sep=",", encoding="utf-8", index=False) 
 
 # Функция для загрузки данных в ClickHouse из CSV
-def upload_to_clickhouse(table_name,**context):
+def upload_to_clickhouse(**context):
     
     ds = context['ds']
 
     csv_file = context["templates_dict"]["csv_file"]
+    table_name = context["templates_dict"]["table_name"]
 
     # Чтение данных из CSV
     data_frame = pd.read_csv(csv_file)  
@@ -80,7 +81,7 @@ def upload_to_clickhouse(table_name,**context):
     
 # Определяем DAG, это контейнер для описания нашего пайплайна
 dag = DAG(
-    dag_id='xml_join5',
+    dag_id='xml_join6',
     schedule='@daily',      
     
     # Начало и конец загрузки 
